@@ -1,8 +1,14 @@
-"""STRM 的按需播放代理；Range 与 HLS 均保留 Peach 鉴权和上游地址隔离。"""
+"""STRM 的按需播放代理；Range 与 HLS 均保留 Peach 鉴权和上游地址隔离。
+
+fork（reaweflow/peach）：设置 PEACH_STRM_REDIRECT=1（默认）时，首个播放请求直接
+302 到 STRM 里的上游地址，让客户端自己去 CDN 取流，和本机 Emby/LitePan 的直连方式一致，
+不再把整部片子的流量转经 Peach 所在主机。带 `noredirect=1` 的请求或该变量设为 0 时仍走代理。
+"""
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import threading
 import time
 from collections import OrderedDict
@@ -10,7 +16,7 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 from starlette.background import BackgroundTask
-from starlette.responses import JSONResponse, Response, StreamingResponse
+from starlette.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 
 from .follow_stream import FollowProxyError, ResolvedFollowMedia, open_upstream
 from .http import public_https_url, resolves_publicly
@@ -21,6 +27,8 @@ from .user_messages import message_fields
 
 PLAYLIST_TYPES = frozenset({'application/vnd.apple.mpegurl', 'application/x-mpegurl', 'audio/mpegurl'})
 PLAYLIST_LIMIT = 2 * 1024 * 1024
+# fork：默认把首个 STRM 播放请求 302 到上游；PEACH_STRM_REDIRECT=0/false 关闭。
+REDIRECT_UPSTREAM = os.environ.get('PEACH_STRM_REDIRECT', '1').strip().lower() not in {'0', 'false', 'no', ''}
 
 
 def mime_type(url: str) -> str:
@@ -90,6 +98,12 @@ def proxy(request, asset_id: int, path, session: str = '', resource: str = ''):
     try:
         root = read_target(path)
         target = resources(state).get(resource, asset_id, root) if resource else root
+        # fork：首次请求直接 302 到 STRM 上游，客户端自行取流（Range/HLS 都由客户端处理）。
+        if (REDIRECT_UPSTREAM and not resource
+                and request.query_params.get('noredirect', '').lower() not in {'1', 'true', 'yes'}):
+            return RedirectResponse(target, status_code=302,
+                                    headers={'cache-control': 'no-store',
+                                             'referrer-policy': 'no-referrer'})
         upstream = open_upstream(
             state.http_transport.client, request.method, ResolvedFollowMedia(target, ''),
             incoming=request.headers, allowed=lambda url: allowed_hop(root, url),
